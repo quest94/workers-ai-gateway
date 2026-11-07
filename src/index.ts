@@ -62,7 +62,7 @@ export default {
           // 中文、日文、韩文等双字节字符算 1 token，其他算 1 token
           const doubleByteRegex = /[\u4e00-\u9fa5\u0800-\u4e00\uac00-\ud7af]/;
           for (const char of text) {
-            tokens += doubleByteRegex.test(char) ? 1 : 1;
+            tokens += doubleByteRegex.test(char) ? 1 : 0.25;
           }
           return tokens;
         };
