@@ -1,5 +1,3 @@
-// src/index.ts
-
 export interface Env {
   AI: Ai;
   AUTH_KEY: string;
@@ -86,9 +84,9 @@ export default {
         const aiResponse = await env.AI.run(model, {
           messages: messages.map((m: any) => ({
             role: m.role,
-            content: typeof m.content === "string" ? m.content : 
-                     (Array.isArray(m.content) 
-                       ? m.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n") 
+            content: typeof m.content === "string" ? m.content :
+                     (Array.isArray(m.content)
+                       ? m.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n")
                        : ""),
           })),
           stream: true,
@@ -99,6 +97,21 @@ export default {
           const responseStream = new ReadableStream({
             async start(controller) {
               let completionTokens = 0;
+              let heartbeat: ReturnType<typeof setInterval> | null = null;
+
+              const startHeartbeat = () => {
+                if (heartbeat) clearInterval(heartbeat);
+                heartbeat = setInterval(() => {
+                  controller.enqueue(new TextEncoder().encode(`: heartbeat\n\n`));
+                }, 15000);
+              };
+
+              const stopHeartbeat = () => {
+                if (heartbeat) {
+                  clearInterval(heartbeat);
+                  heartbeat = null;
+                }
+              };
 
               try {
                 // 发送初始块，带 role 防止客户端超时
@@ -111,14 +124,19 @@ export default {
                 });
                 controller.enqueue(new TextEncoder().encode(`data: ${initialChunk}\n\n`));
 
-                // 发送心跳包，保持长连接活跃
-                const heartbeat = setInterval(() => {
-                  controller.enqueue(new TextEncoder().encode(`: heartbeat\n\n`));
-                }, 15000);
+                // 启动心跳，防止首 token 冷启动超时
+                startHeartbeat();
 
                 for await (const chunk of aiResponse) {
-                  clearInterval(heartbeat);
-                  const text = chunk.response || "";
+                  // 每收到一个有效 chunk 就重启心跳，防止生成中途停顿断连
+                  startHeartbeat();
+
+                  const text = (
+                    (chunk as any).response ??
+                    (chunk as any).response_text ??
+                    (typeof chunk === "string" ? chunk : "")
+                  ) as string;
+
                   if (!text) continue;
 
                   completionTokens += calculateTokens(text);
@@ -133,14 +151,24 @@ export default {
                   controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
                 }
 
-                // 根据客户端是否请求 include_usage，发送规范的收尾块
+                // 无论是否请求 usage，都先发一个明确的 stop 收尾块
+                const stopChunk = JSON.stringify({
+                  id: `chatcmpl-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                });
+                controller.enqueue(new TextEncoder().encode(`data: ${stopChunk}\n\n`));
+
+                // 根据客户端是否请求 include_usage，发送 usage 收尾块
                 if (includeUsage) {
                   const finalChunk = JSON.stringify({
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model: model,
-                    choices: [], // 官方规范：带 usage 的流式收尾块 choices 必须为空
+                    choices: [],
                     usage: {
                       prompt_tokens: promptTokens,
                       completion_tokens: completionTokens,
@@ -153,9 +181,13 @@ export default {
                 // 发送结束标记
                 controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
               } catch (e: any) {
-                controller.enqueue(new TextEncoder().encode(`data: {"error": "${e.message}"}\n\n`));
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    `data: ${JSON.stringify({ error: String(e.message ?? e) })}\n\n`
+                  )
+                );
               } finally {
-                clearInterval(heartbeat);
+                stopHeartbeat();
                 controller.close();
               }
             },
@@ -164,16 +196,22 @@ export default {
           return new Response(responseStream, {
             headers: {
               "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
               "Access-Control-Allow-Origin": "*",
+              "X-Accel-Buffering": "no",
             },
           });
         } else {
           // ===== 非流式响应分支 =====
           let fullText = "";
           for await (const chunk of aiResponse) {
-            fullText += chunk.response || "";
+            const text = (
+              (chunk as any).response ??
+              (chunk as any).response_text ??
+              (typeof chunk === "string" ? chunk : "")
+            ) as string;
+            fullText += text;
           }
 
           const completionTokens = calculateTokens(fullText);
