@@ -1,180 +1,223 @@
+// src/index.ts
 
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-
-const app = new Hono<{ Bindings: { AI: any } }>();
-
-// 默认模型，可按需修改
-const DEFAULT_MODEL = '@cf/qwen/qwen2.5-coder-32b-instruct';
-
-// 开启 CORS，允许 CC-Switch 等本地应用跨域访问
-app.use('*', cors());
-app.options('*', (c) => c.text('', 204));
-
-// ===== 把任意 content 归一成纯字符串 =====
-// Anthropic / Claude Code 的 content 常常是数组（富文本块 / tool_result），
-// Workers AI 的 @cf/qwen 只接受字符串，必须在这里拉平，否则报 5006 oneOf not met。
-function toText(content: any): string {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part: any) => {
-        if (typeof part === 'string') return part;
-        if (part.type === 'text' && typeof part.text === 'string') return part.text;
-        // 工具结果块：tool_result 的 content 可能是字符串或数组，递归拉平
-        if (part.type === 'tool_result') return toText(part.content);
-        // 其他块（图片等）无法作为文本喂给模型，直接丢弃
-        return '';
-      })
-      .filter((s: string) => s.length > 0)
-      .join('\n');
-  }
-  if (typeof content === 'object') {
-    // 兜底：个别实现把 content 包成 {text: ...}
-    if (typeof content.text === 'string') return content.text;
-    return '';
-  }
-  return String(content);
+export interface Env {
+  AI: Ai;
+  AUTH_KEY: string; // 可以在 Cloudflare 环境变量或 .dev.vars 里设置，防止公开滥用
 }
 
-// ===== 归一 role：Workers AI 只认 system / user / assistant =====
-function toRole(role: any): string {
-  if (role === 'system') return 'system';
-  if (role === 'assistant') return 'assistant';
-  // tool / function 等一律并入 user，避免非法 role 触发 schema 报错
-  return 'user';
-}
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-// 核心路由：兼容 OpenAI 的 /v1/chat/completions
-app.post('/v1/chat/completions', async (c) => {
-  try {
-    const body = await c.req.json();
-    const { messages, stream = false, model: requestedModel } = body;
-
-    if (!messages || !Array.isArray(messages)) {
-      return c.json({ error: 'Invalid messages format' }, 400);
+    // 基础认证检查（如果设置了 AUTH_KEY）
+    if (env.AUTH_KEY && request.headers.get("Authorization") !== `Bearer ${env.AUTH_KEY}`) {
+      return new Response("Unauthorized", { status: 401 });
     }
 
-    // 规范化：role 收敛到三种合法值，content 全部转成字符串，并过滤掉空消息
-    const formattedMessages = messages
-      .map((m: any) => ({
-        role: toRole(m.role),
-        content: toText(m.content),
-      }))
-      .filter((m: any) => m.content.length > 0);
-
-    if (formattedMessages.length === 0) {
-      return c.json({ error: 'No usable messages after normalization' }, 400);
-    }
-
-    const model = requestedModel || DEFAULT_MODEL;
-
-    // ===== 流式分支 =====
-    // Workers AI 的 stream:true 返回的是【异步可迭代对象】(每次 yield {response:"片段"})，
-    // 不是现成的 SSE 字节流，所以必须 for await 读出后自己封成 SSE 的 data: 行，不能直接 pipe。
-    if (stream) {
-      const aiResponse = await c.env.AI.run(model, {
-        messages: formattedMessages,
-        stream: true,
-      });
-
-      const encoder = new TextEncoder();
-      const created = Math.floor(Date.now() / 1000);
-      const id = 'chatcmpl-' + Date.now();
-      const sse = (obj: any) => 'data: ' + JSON.stringify(obj) + '\n\n';
-
-      const readable = new ReadableStream({
-        async start(controller) {
-          try {
-            // 1) 立刻先发一个 role 首块：让客户端第一时间收到字节、确认流已建立，
-            //    避免 32B 模型冷启动首 token 慢时被判定 "ended before any complete data"。
-            controller.enqueue(
-              encoder.encode(
-                sse({
-                  id,
-                  object: 'chat.completion.chunk',
-                  created,
-                  model,
-                  choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
-                }),
-              ),
-            );
-
-            // 2) 正常转发每个 token 片段
-            for await (const chunk of aiResponse as any) {
-              const text = chunk.response || '';
-              if (!text) continue;
-              controller.enqueue(
-                encoder.encode(
-                  sse({
-                    id,
-                    object: 'chat.completion.chunk',
-                    created,
-                    model,
-                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-                  }),
-                ),
-              );
-            }
-
-            // 3) 收尾块：finish_reason = stop。OpenAI/Claude Code 据此判断流正常结束，
-            //    缺少这块是 "streaming ended before complete data" 的常见诱因。
-            controller.enqueue(
-              encoder.encode(
-                sse({
-                  id,
-                  object: 'chat.completion.chunk',
-                  created,
-                  model,
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                }),
-              ),
-            );
-
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          } catch (err: any) {
-            // 上游流中途异常：发一个 error 块再关闭，避免连接挂死让客户端无限等待
-            controller.enqueue(encoder.encode(sse({ error: err?.message || 'stream error' })));
-          } finally {
-            controller.close();
-          }
-        },
-      });
-
-      return new Response(readable, {
+    // CORS 预检处理
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
         headers: {
-          'Content-Type': 'text/event-stream',
-          // no-transform 防止中间网关/代理二次缓冲你的流
-          'Cache-Control': 'no-cache, no-transform',
-          Connection: 'keep-alive',
-          // 关掉 Nginx 系代理的缓冲（部分出口/反代有效）
-          'X-Accel-Buffering': 'no',
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
       });
     }
 
-    // ===== 非流式分支 =====
-    // 不传 stream 时，run 返回【普通对象】，直接取 .response，绝对不能 for await
-    const result = await c.env.AI.run(model, { messages: formattedMessages });
-    const text = (result as any).response;
+    // 1. 模型列表接口 (OpenAI 兼容)
+    if (url.pathname === "/v1/models") {
+      const models = {
+        object: "list",
+        data: [
+          {
+            id: "@cf/qwen/qwen2.5-coder-32b-instruct",
+            object: "model",
+            created: 1677610602,
+            owned_by: "qwen",
+          },
+          // 可以在这里添加其他 Workers AI 模型
+        ],
+      };
+      return new Response(JSON.stringify(models), {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
 
-    return c.json({
-      id: 'chatcmpl-' + Date.now(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [
-        { index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' },
-      ],
-    });
-  } catch (e: any) {
-    console.error('AI Error:', e);
-    return c.json({ error: e.message || 'Internal Server Error' }, 500);
-  }
-});
+    // 2. 聊天补全接口
+    if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
+      try {
+        const body = await request.json<any>();
+        const { model, messages, stream = false } = body;
 
-// 健康检查
-app.get('/', (c) => c.json({ status: 'ok', message: 'Workers AI Gateway is running' }));
+        // 简单的请求参数校验
+        if (!model || !messages || !Array.isArray(messages)) {
+          return new Response("Bad Request", { status: 400 });
+        }
 
-export default app;
+        // 计算伪造的 token 数
+        const calculateTokens = (text: string) => {
+          if (!text) return 0;
+          let tokens = 0;
+          // 中文、日文、韩文等双字节字符算 1 token，其他算 1 token
+          const doubleByteRegex = /[\u4e00-\u9fa5\u0800-\u4e00\uac00-\ud7af]/;
+          for (const char of text) {
+            tokens += doubleByteRegex.test(char) ? 1 : 1;
+          }
+          return tokens;
+        };
+
+        let promptTokens = 0;
+        for (const msg of messages) {
+          if (typeof msg.content === "string") {
+            promptTokens += calculateTokens(msg.content);
+          } else if (Array.isArray(msg.content)) {
+            for (const contentPart of msg.content) {
+              if (contentPart.type === "text") {
+                promptTokens += calculateTokens(contentPart.text || "");
+              }
+            }
+          }
+        }
+
+        // 执行 Workers AI 推理
+        // @ts-ignore
+        const aiResponse = await env.AI.run(model, {
+          messages: messages.map((m: any) => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : 
+                     (Array.isArray(m.content) 
+                       ? m.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n") 
+                       : ""),
+          })),
+          stream: true, // 始终让 Workers AI 流式输出，前端自己决定要不要流式
+        });
+
+        if (stream) {
+          // 流式响应分支
+          const stream = new ReadableStream({
+            async start(controller) {
+              let completionTokens = 0;
+              let isFirstChunk = true;
+
+              try {
+                // 先发送一个带 role 的空块，防止客户端冷启动超时
+                const initialChunk = JSON.stringify({
+                  id: `chatcmpl-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+                });
+                controller.enqueue(new TextEncoder().encode(`data: ${initialChunk}\n\n`));
+
+                // 发送心跳包，保持连接活跃
+                const heartbeat = setInterval(() => {
+                  controller.enqueue(new TextEncoder().encode(`: heartbeat\n\n`));
+                }, 15000);
+
+                for await (const chunk of aiResponse) {
+                  clearInterval(heartbeat);
+                  const text = chunk.response || "";
+                  if (!text) continue;
+
+                  completionTokens += calculateTokens(text);
+
+                  const data = JSON.stringify({
+                    id: `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                  });
+                  controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
+                }
+
+                // 发送带 usage 的完成块
+                const finalChunk = JSON.stringify({
+                  id: `chatcmpl-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                  usage: {
+                    prompt_tokens: promptTokens,
+                    completion_tokens: completionTokens,
+                    total_tokens: promptTokens + completionTokens,
+                  },
+                });
+                controller.enqueue(new TextEncoder().encode(`data: ${finalChunk}\n\n`));
+                
+                // 发送结束标记
+                controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+              } catch (e: any) {
+                controller.enqueue(new TextEncoder().encode(`data: {"error": "${e.message}"}\n\n`));
+              } finally {
+                controller.close();
+              }
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        } else {
+          // 非流式响应分支
+          let fullText = "";
+          for await (const chunk of aiResponse) {
+            fullText += chunk.response || "";
+          }
+
+          const completionTokens = calculateTokens(fullText);
+
+          const responseData = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            usage: {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+            },
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: fullText,
+                },
+                finish_reason: "stop",
+              },
+            ],
+          };
+
+          return new Response(JSON.stringify(responseData), {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        }
+
+      } catch (e: any) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // 健康检查
+    if (url.pathname === "/health") {
+      return new Response("OK", { status: 200 });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};
