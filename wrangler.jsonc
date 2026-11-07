@@ -1,16 +1,17 @@
 {
-	"compatibility_date": "2025-10-08",
-	"main": "src/index.ts",
-	"name": "workers-ai-gateway",
-	"upload_source_maps": true,
-	"observability": {
-		"enabled": true
-	},
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "Automatic-DB",
-			"database_id": "c08b9011-c2d4-4805-829f-0f974e4fb682"
-		}
-	]
+  "compatibility_date": "2025-10-08",
+  "main": "src/index.ts",
+  "name": "workers-ai-gateway",
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "Automatic-DB",
+      "database_id": "c08b9011-c2d4-4805-829f-0f974e4fb682"
+    }
+  ]
 }
