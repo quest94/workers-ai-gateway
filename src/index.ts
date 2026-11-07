@@ -3,6 +3,33 @@ export interface Env {
   AUTH_KEY: string;
 }
 
+function parseSSEChunks(
+  rawChunks: AsyncIterable<string | Uint8Array>,
+  onText: (text: string) => void
+) {
+  let buffer = "";
+  for await (const chunk of rawChunks) {
+    const raw = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+    buffer += raw;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(":")) continue;
+      if (trimmed === "data: [DONE]") continue;
+      const data = trimmed.replace(/^data:\s*/, "");
+      if (!data) continue;
+      try {
+        const parsed = JSON.parse(data) as { response?: string; response_text?: string };
+        const text = parsed.response ?? parsed.response_text ?? "";
+        if (text) onText(text);
+      } catch {
+        // 忽略非 JSON 行
+      }
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -127,18 +154,8 @@ export default {
                 // 启动心跳，防止首 token 冷启动超时
                 startHeartbeat();
 
-                for await (const chunk of aiResponse) {
-                  // 每收到一个有效 chunk 就重启心跳，防止生成中途停顿断连
+                parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
                   startHeartbeat();
-
-                  const text = (
-                    (chunk as any).response ??
-                    (chunk as any).response_text ??
-                    (typeof chunk === "string" ? chunk : "")
-                  ) as string;
-
-                  if (!text) continue;
-
                   completionTokens += calculateTokens(text);
 
                   const data = JSON.stringify({
@@ -149,7 +166,7 @@ export default {
                     choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
                   });
                   controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
-                }
+                });
 
                 // 无论是否请求 usage，都先发一个明确的 stop 收尾块
                 const stopChunk = JSON.stringify({
@@ -205,14 +222,9 @@ export default {
         } else {
           // ===== 非流式响应分支 =====
           let fullText = "";
-          for await (const chunk of aiResponse) {
-            const text = (
-              (chunk as any).response ??
-              (chunk as any).response_text ??
-              (typeof chunk === "string" ? chunk : "")
-            ) as string;
+          parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
             fullText += text;
-          }
+          });
 
           const completionTokens = calculateTokens(fullText);
 
