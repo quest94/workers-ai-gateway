@@ -71,7 +71,8 @@ app.post('/v1/chat/completions', async (c) => {
     const model = requestedModel || DEFAULT_MODEL;
 
     // ===== 流式分支 =====
-    // 只有传 stream:true 时，run 才返回【异步可迭代对象】，才能 for await
+    // Workers AI 的 stream:true 返回的是【异步可迭代对象】(每次 yield {response:"片段"})，
+    // 不是现成的 SSE 字节流，所以必须 for await 读出后自己封成 SSE 的 data: 行，不能直接 pipe。
     if (stream) {
       const aiResponse = await c.env.AI.run(model, {
         messages: formattedMessages,
@@ -79,32 +80,76 @@ app.post('/v1/chat/completions', async (c) => {
       });
 
       const encoder = new TextEncoder();
+      const created = Math.floor(Date.now() / 1000);
+      const id = 'chatcmpl-' + Date.now();
+      const sse = (obj: any) => 'data: ' + JSON.stringify(obj) + '\n\n';
+
       const readable = new ReadableStream({
         async start(controller) {
-          for await (const chunk of aiResponse as any) {
-            const text = chunk.response || '';
-            const data =
-              'data: ' +
-              JSON.stringify({
-                id: 'chatcmpl-' + Date.now(),
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-              }) +
-              '\n\n';
-            controller.enqueue(encoder.encode(data));
+          try {
+            // 1) 立刻先发一个 role 首块：让客户端第一时间收到字节、确认流已建立，
+            //    避免 32B 模型冷启动首 token 慢时被判定 "ended before any complete data"。
+            controller.enqueue(
+              encoder.encode(
+                sse({
+                  id,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model,
+                  choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+                }),
+              ),
+            );
+
+            // 2) 正常转发每个 token 片段
+            for await (const chunk of aiResponse as any) {
+              const text = chunk.response || '';
+              if (!text) continue;
+              controller.enqueue(
+                encoder.encode(
+                  sse({
+                    id,
+                    object: 'chat.completion.chunk',
+                    created,
+                    model,
+                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                  }),
+                ),
+              );
+            }
+
+            // 3) 收尾块：finish_reason = stop。OpenAI/Claude Code 据此判断流正常结束，
+            //    缺少这块是 "streaming ended before complete data" 的常见诱因。
+            controller.enqueue(
+              encoder.encode(
+                sse({
+                  id,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model,
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                }),
+              ),
+            );
+
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          } catch (err: any) {
+            // 上游流中途异常：发一个 error 块再关闭，避免连接挂死让客户端无限等待
+            controller.enqueue(encoder.encode(sse({ error: err?.message || 'stream error' })));
+          } finally {
+            controller.close();
           }
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
         },
       });
 
       return new Response(readable, {
         headers: {
           'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
+          // no-transform 防止中间网关/代理二次缓冲你的流
+          'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
+          // 关掉 Nginx 系代理的缓冲（部分出口/反代有效）
+          'X-Accel-Buffering': 'no',
         },
       });
     }
