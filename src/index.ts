@@ -3,7 +3,7 @@ export interface Env {
   AUTH_KEY: string;
 }
 
-function parseSSEChunks(
+async function parseSSEChunks(
   rawChunks: AsyncIterable<string | Uint8Array>,
   onText: (text: string) => void
 ) {
@@ -154,7 +154,7 @@ export default {
                 // 启动心跳，防止首 token 冷启动超时
                 startHeartbeat();
 
-                parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
+                await parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
                   startHeartbeat();
                   completionTokens += calculateTokens(text);
 
@@ -173,7 +173,7 @@ export default {
                   id: `chatcmpl-${Date.now()}`,
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
-                  model: model,
+                  model,
                   choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
                 });
                 controller.enqueue(new TextEncoder().encode(`data: ${stopChunk}\n\n`));
@@ -184,7 +184,7 @@ export default {
                     id: `chatcmpl-${Date.now()}`,
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
-                    model: model,
+                    model,
                     choices: [],
                     usage: {
                       prompt_tokens: promptTokens,
@@ -222,7 +222,7 @@ export default {
         } else {
           // ===== 非流式响应分支 =====
           let fullText = "";
-          parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
+          await parseSSEChunks(aiResponse as unknown as AsyncIterable<string | Uint8Array>, (text) => {
             fullText += text;
           });
 
@@ -232,7 +232,7 @@ export default {
             id: `chatcmpl-${Date.now()}`,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
-            model: model,
+            model,
             usage: {
               prompt_tokens: promptTokens,
               completion_tokens: completionTokens,
