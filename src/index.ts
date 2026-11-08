@@ -1,3 +1,4 @@
+
 export interface Env {
   AI: Ai;
   AUTH_KEY: string;
@@ -56,10 +57,53 @@ export default {
         object: "list",
         data: [
           {
+            id: "@cf/qwen/qwen3-30b-a3b-fp8",
+            object: "model",
+            created: 1677610602,
+            owned_by: "qwen",
+            // 极致省：MoE仅3B激活，免费额度撑最久
+          },
+          {
+            id: "@cf/zai-org/glm-4.7-flash",
+            object: "model",
+            created: 1677610602,
+            owned_by: "zai-org",
+            // 首选：原生多轮工具调用，对Claude Code最友好
+          },
+          {
             id: "@cf/qwen/qwen2.5-coder-32b-instruct",
             object: "model",
             created: 1677610602,
             owned_by: "qwen",
+            // 编程专用：写代码场景
+          },
+          {
+            id: "@cf/google/gemma-4-26b-a4b-it",
+            object: "model",
+            created: 1677610602,
+            owned_by: "google",
+            // 便宜且质量在线
+          },
+          {
+            id: "@cf/openai/gpt-oss-20b",
+            object: "model",
+            created: 1677610602,
+            owned_by: "openai",
+            // 推理/agent能力强的开源权重
+          },
+          {
+            id: "@cf/mistralai/mistral-small-3.1-24b-instruct",
+            object: "model",
+            created: 1677610602,
+            owned_by: "mistralai",
+            // 多模态，稍贵
+          },
+          {
+            id: "@cf/meta/llama-3.1-8b-instruct-awq",
+            object: "model",
+            created: 1677610602,
+            owned_by: "meta",
+            // 纯学习够，工具调用较弱
           },
         ],
       };
