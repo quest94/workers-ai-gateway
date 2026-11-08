@@ -113,7 +113,7 @@ export default {
       });
     }
 
-    // 2. 聊天补全接口
+    // 2. 文本生成接口
     if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
       try {
         const body = await request.json<any>();
